@@ -1,0 +1,959 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>The WND / tagWND Object in ReactOS and Windows</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+         max-width: 1100px; margin: 2em auto; padding: 0 1em;
+         color: #1a1a1a; line-height: 1.55; }
+  h1, h2, h3, h4 { color: #0b3d8c; line-height: 1.25; }
+  h1 { border-bottom: 2px solid #0b3d8c; padding-bottom: .25em; }
+  h2 { border-bottom: 1px solid #cdd5e3; padding-bottom: .15em; margin-top: 2em; }
+  code, pre { font-family: "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace; }
+  pre { background: #f4f6fb; border: 1px solid #d6dceb; border-radius: 6px;
+        padding: 0.8em 1em; overflow-x: auto; font-size: 0.88em; }
+  code { background: #eef1f8; padding: 0.05em 0.35em; border-radius: 3px; font-size: 0.92em; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; margin: 1em 0; width: 100%; font-size: 0.9em; }
+  th, td { border: 1px solid #cdd5e3; padding: 0.4em 0.7em; text-align: left;
+           vertical-align: top; }
+  th { background: #e8eef9; font-weight: 600; }
+  tr:nth-child(even) td { background: #fafbfe; }
+  td.hex { font-family: "JetBrains Mono", Consolas, monospace; white-space: nowrap; }
+  td.field { font-family: "JetBrains Mono", Consolas, monospace; }
+  .note { background: #fff7d6; border-left: 4px solid #d4a82a;
+          padding: 0.6em 1em; margin: 1em 0; border-radius: 4px; }
+  .ros { background: #e7f5ee; border-left: 4px solid #2e8b57;
+         padding: 0.6em 1em; margin: 1em 0; border-radius: 4px; }
+  .win { background: #eaf0fc; border-left: 4px solid #2e62cf;
+         padding: 0.6em 1em; margin: 1em 0; border-radius: 4px; }
+  .danger { background: #fce8e8; border-left: 4px solid #c83434;
+            padding: 0.6em 1em; margin: 1em 0; border-radius: 4px; }
+  ul.refs li { margin: 0.3em 0; }
+  .legend { font-size: 0.85em; color: #555; }
+  .field-name { font-weight: 600; color: #0b3d8c; }
+</style>
+</head>
+<body>
+
+<h1>The <code>WND</code> / <code>tagWND</code> Object in ReactOS and Windows</h1>
+
+<p><em>A field-by-field, code-traced reference for the kernel-mode window
+object, contrasted with the documented Windows layout, including a discussion
+of the Win32k Type Isolation mitigation.</em></p>
+
+<h2>1. What is <code>WND</code> / <code>tagWND</code>?</h2>
+
+<p>Every visible (and most invisible) window on the screen — every dialog, every
+button, every menu, every desktop, every tooltip — is represented inside the
+kernel-mode window manager (<code>win32k.sys</code> on Windows;
+<code>win32k.sys</code> in ReactOS, source under
+<code>win32ss/user/ntuser/</code>) by a single instance of the
+<code>WND</code> structure. The Windows-internal name for this structure is
+<code>tagWND</code>; ReactOS calls it <code>struct&nbsp;_WND</code> with the
+<code>typedef</code> name <code>WND</code>. The pointer typedef
+<code>PWND</code> (i.e.&nbsp;<code>WND&nbsp;*</code>) is what application,
+user32, and win32k code commonly refer to as &ldquo;a pWND&rdquo;.</p>
+
+<p>The <code>HWND</code> handle that user-mode applications pass to
+<code>CreateWindow</code>, <code>SetWindowText</code>, etc.&nbsp;is a numeric
+handle (a slot index into a global handle table); the actual data lives in the
+<code>WND</code> object on the desktop heap. The relationship is:</p>
+
+<pre><code>HWND  ──(handle table)──►  PWND  ──►  WND { head, state, style, ..., strName, ... }</code></pre>
+
+<p>The structure stores everything the window manager needs to know about that
+window:</p>
+
+<ul>
+  <li>identity and lifetime (<code>head.h</code>, <code>head.cLockObj</code>,
+      destruction state bits);</li>
+  <li>ownership (<code>head.pti</code> &ndash; thread,
+      <code>head.rpdesk</code> &ndash; desktop, <code>head.pSelf</code> &ndash;
+      kernel self-pointer);</li>
+  <li>style, extended style, state bitmasks;</li>
+  <li>tree position (<code>spwndParent</code>, <code>spwndChild</code>,
+      <code>spwndOwner</code>, <code>spwndNext</code>, <code>spwndPrev</code>);</li>
+  <li>geometry (<code>rcWindow</code>, <code>rcClient</code>);</li>
+  <li>window procedure (<code>lpfnWndProc</code>) and class pointer
+      (<code>pcls</code>);</li>
+  <li>painting region (<code>hrgnUpdate</code>) and clip region
+      (<code>hrgnClip</code>);</li>
+  <li>property list, scrollbar info, menu, name,
+      window-extra-bytes size, last-active descendant, IME context, user data,
+      activation context, clipboard listener chain, and so on.</li>
+</ul>
+
+<p>It is, in short, the central data structure of the GUI subsystem.</p>
+
+
+<h2>2. ReactOS layout (traced from <code>win32ss/include/ntuser.h:693</code>)</h2>
+
+<p>The struct is declared as follows
+(<code>win32ss/include/ntuser.h:689-767</code>):</p>
+
+<pre><code>/*
+ * WND structure.
+ * See also: https://reactos.org/wiki/Techwiki:Win32k/WND
+ */
+typedef struct _WND
+{
+    THRDESKHEAD head;
+#if 0
+    WW ww;
+#else
+    /* These fields should be moved in the WW at some point. */
+    /* Plese do not change them to keep the same layout with WW. */
+    DWORD state;
+    DWORD state2;
+    DWORD ExStyle;
+    DWORD style;
+    HINSTANCE hModule;
+    DWORD fnid;
+#endif
+    struct _WND *spwndNext;
+    struct _WND *spwndPrev;
+    struct _WND *spwndParent;
+    struct _WND *spwndChild;
+    struct _WND *spwndOwner;
+    RECT rcWindow;
+    RECT rcClient;
+    WNDPROC lpfnWndProc;
+    PCLS pcls;
+    HRGN hrgnUpdate;
+    LIST_ENTRY PropListHead;
+    ULONG PropListItems;
+    PSBINFO pSBInfo;
+    HMENU SystemMenu;        /* //PMENU spmenuSys; */
+    UINT_PTR IDMenu;         /* //PMENU spmenu;     */
+    HRGN hrgnClip;
+    HRGN hrgnNewFrame;
+    LARGE_UNICODE_STRING strName;
+    ULONG cbwndExtra;
+    struct _WND *spwndLastActive;
+    HIMC hImc;
+    LONG_PTR dwUserData;
+    PVOID pActCtx;           /* //PD3DMATRIX pTransForm; commented out */
+    struct _WND *spwndClipboardListener;
+    DWORD ExStyle2;
+    /* ReactOS */
+    struct {
+        RECT NormalRect;
+        POINT IconPos;
+        POINT MaxPos;
+        UINT flags;
+    } InternalPos;
+    UINT Unicode:1;
+    UINT InternalPosInitialized:1;
+    UINT HideFocus:1;
+    UINT HideAccel:1;
+    PSBINFOEX pSBInfoex;
+    LIST_ENTRY ThreadListEntry;
+    PVOID DialogPointer;
+} WND, *PWND;</code></pre>
+
+<p>The struct ends with the assertion
+<code>C_ASSERT(sizeof(WND) % sizeof(PVOID) == 0)</code>
+(<code>win32ss/include/ntuser.h:1247</code>), guaranteeing pointer-aligned
+total size on both x86 and x64.</p>
+
+<h3>2.1 Sub-structure: <code>THRDESKHEAD head</code></h3>
+
+<p><code>THRDESKHEAD</code> is built from three nested layers
+(<code>win32ss/include/ntuser.h:179&ndash;196</code>):</p>
+
+<pre><code>typedef struct _HEAD          { HANDLE h; DWORD cLockObj; }                   HEAD;
+typedef struct _THROBJHEAD    { HEAD; struct _THREADINFO *pti; }              THROBJHEAD;
+typedef struct _THRDESKHEAD   { THROBJHEAD; struct _DESKTOP *rpdesk; PVOID pSelf; }
+                                                                              THRDESKHEAD;</code></pre>
+
+<p>Flat layout of <code>head</code> as it appears at the start of every
+<code>WND</code>:</p>
+
+<table>
+  <thead><tr><th>x86 off.</th><th>x64 off.</th><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td class="hex">0x00</td><td class="hex">0x00</td><td class="field">head.h</td><td>HANDLE</td>
+        <td>The <code>HWND</code> for this window. Macro
+            <code>UserHMGetHandle(obj)</code> at line 230 returns
+            <code>(obj)-&gt;head.h</code>.</td></tr>
+    <tr><td class="hex">0x04</td><td class="hex">0x08</td><td class="field">head.cLockObj</td><td>DWORD</td>
+        <td>Reference / lock count. Incremented by
+            <code>IntGetWindowObject</code>
+            (<code>win32ss/user/ntuser/window.c:83</code>:
+            <code>Window-&gt;head.cLockObj++</code>).</td></tr>
+    <tr><td class="hex">0x08</td><td class="hex">0x10</td><td class="field">head.pti</td><td>PTHREADINFO</td>
+        <td>Owning GUI thread (W32THREAD). Used in
+            <code>IntSetStyle</code> at lines 153&ndash;154
+            (<code>pwnd-&gt;head.pti-&gt;cVisWindows--</code>).</td></tr>
+    <tr><td class="hex">0x0C</td><td class="hex">0x18</td><td class="field">head.rpdesk</td><td>PDESKTOP</td>
+        <td>Desktop this window lives on. Set in
+            <code>AllocDeskThreadObject</code>
+            (<code>object.c:79</code>: <code>ObjHead-&gt;rpdesk = pDesk;</code>).</td></tr>
+    <tr><td class="hex">0x10</td><td class="hex">0x20</td><td class="field">head.pSelf</td><td>PVOID</td>
+        <td><strong>Kernel self-pointer</strong>. Set immediately after
+            allocation (<code>object.c:78</code>:
+            <code>ObjHead-&gt;pSelf = ObjHead;</code>) so any code holding the
+            object can recover its kernel address.</td></tr>
+  </tbody>
+</table>
+
+<h3>2.2 The &ldquo;WW&rdquo; substitute block (state and style)</h3>
+
+<p>The <code>#if 0 / #else</code> branch at lines 696&ndash;710 is a deliberate
+layout-compatibility trick. The disabled <code>WW ww;</code> form is what
+Windows uses internally; ReactOS lays the same fields out inline so the byte
+offsets match. The comment is explicit:</p>
+
+<blockquote class="ros">
+<em>&ldquo;These fields should be moved in the WW at some point.
+Plese do not change them to keep the same layout with WW.&rdquo;</em>
+&mdash; <code>win32ss/include/ntuser.h:699-700</code>
+</blockquote>
+
+<table>
+  <thead><tr><th>x86 off.</th><th>x64 off.</th><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td class="hex">0x14</td><td class="hex">0x28</td><td class="field">state</td><td>DWORD</td>
+        <td>First state bitmask. Bit definitions are <code>WNDS_*</code> at
+            <code>ntuser.h:605-636</code> &mdash; e.g.&nbsp;
+            <code>WNDS_HASMENU&nbsp;0x1</code>,
+            <code>WNDS_HASCAPTION&nbsp;0x8</code>,
+            <code>WNDS_DESTROYED&nbsp;0x80000000</code>.
+            Tested in <code>VerifyWnd</code>
+            (<code>window.c:93</code>).</td></tr>
+    <tr><td class="hex">0x18</td><td class="hex">0x2C</td><td class="field">state2</td><td>DWORD</td>
+        <td>Second state bitmask. <code>WNDS2_*</code> at lines 641&ndash;670:
+            <code>WNDS2_WMPAINTSENT</code>,
+            <code>WNDS2_HASCLIENTEDGE</code>,
+            <code>WNDS2_INDESTROY&nbsp;0x80</code>, etc.
+            Also tested in <code>VerifyWnd</code> (<code>window.c:94</code>).</td></tr>
+    <tr><td class="hex">0x1C</td><td class="hex">0x30</td><td class="field">ExStyle</td><td>DWORD</td>
+        <td>Extended window style (<code>WS_EX_*</code>).</td></tr>
+    <tr><td class="hex">0x20</td><td class="hex">0x34</td><td class="field">style</td><td>DWORD</td>
+        <td>Window style (<code>WS_*</code>). Read/written by
+            <code>IntSetStyle</code>
+            (<code>window.c:147&ndash;150</code>).</td></tr>
+    <tr><td class="hex">0x24</td><td class="hex">0x38</td><td class="field">hModule</td><td>HINSTANCE</td>
+        <td><code>HINSTANCE</code> of the module that called
+            <code>CreateWindowEx</code>.</td></tr>
+    <tr><td class="hex">0x28</td><td class="hex">0x40</td><td class="field">fnid</td><td>DWORD</td>
+        <td>&ldquo;Function ID&rdquo; identifying built-in classes. Values at
+            <code>ntuser.h:858&ndash;879</code>:
+            <code>FNID_SCROLLBAR&nbsp;0x29A</code>,
+            <code>FNID_DESKTOP&nbsp;0x29D</code>,
+            <code>FNID_BUTTON&nbsp;0x2A1</code>, &hellip; Used by
+            <code>IntIsWindowVisible</code> to detect the desktop window
+            (<code>window.c:198</code>).</td></tr>
+  </tbody>
+</table>
+
+<h3>2.3 Window tree pointers</h3>
+
+<p>The five sibling/parent/child/owner pointers
+(<code>ntuser.h:711&ndash;715</code>). The <code>sp</code> prefix is win32k
+convention for &ldquo;<em>s</em>elf-referenced <em>p</em>ointer&rdquo; (lock-counted).</p>
+
+<table>
+  <thead><tr><th>x86 off.</th><th>x64 off.</th><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td class="hex">0x2C</td><td class="hex">0x48</td><td class="field">spwndNext</td><td>PWND</td>
+        <td>Next sibling in Z-order under the same parent.</td></tr>
+    <tr><td class="hex">0x30</td><td class="hex">0x50</td><td class="field">spwndPrev</td><td>PWND</td>
+        <td>Previous sibling in Z-order.</td></tr>
+    <tr><td class="hex">0x34</td><td class="hex">0x58</td><td class="field">spwndParent</td><td>PWND</td>
+        <td>Parent window. Returned by <code>IntGetParent</code> for
+            <code>WS_CHILD</code> (<code>window.c:213</code>).</td></tr>
+    <tr><td class="hex">0x38</td><td class="hex">0x60</td><td class="field">spwndChild</td><td>PWND</td>
+        <td>Head of the child list.</td></tr>
+    <tr><td class="hex">0x3C</td><td class="hex">0x68</td><td class="field">spwndOwner</td><td>PWND</td>
+        <td>Owner window (used by <code>WS_POPUP</code>; returned by
+            <code>IntGetParent</code> when <code>WS_POPUP</code>,
+            <code>window.c:209</code>).</td></tr>
+  </tbody>
+</table>
+
+<h3>2.4 Geometry, window-proc, class</h3>
+
+<table>
+  <thead><tr><th>x86 off.</th><th>x64 off.</th><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td class="hex">0x40</td><td class="hex">0x70</td><td class="field">rcWindow</td><td>RECT (16&nbsp;B)</td>
+        <td>Full window bounds in screen coordinates.
+            <code>RECT&nbsp;=&nbsp;LONG&nbsp;left,top,right,bottom</code>
+            (<code>sdk/include/psdk/windef.h:105</code>).</td></tr>
+    <tr><td class="hex">0x50</td><td class="hex">0x80</td><td class="field">rcClient</td><td>RECT (16&nbsp;B)</td>
+        <td>Client-area bounds in screen coordinates (NC frame already
+            subtracted).</td></tr>
+    <tr><td class="hex">0x60</td><td class="hex">0x90</td><td class="field">lpfnWndProc</td><td>WNDPROC</td>
+        <td>The window procedure pointer.</td></tr>
+    <tr><td class="hex">0x64</td><td class="hex">0x98</td><td class="field">pcls</td><td>PCLS</td>
+        <td>Pointer to the window's class object (<code>CLS</code>,
+            <code>ntuser.h:565&ndash;596</code>: holds
+            <code>cbwndExtra</code>, <code>lpfnWndProc</code>,
+            <code>hbrBackground</code>, etc.).</td></tr>
+    <tr><td class="hex">0x68</td><td class="hex">0xA0</td><td class="field">hrgnUpdate</td><td>HRGN</td>
+        <td>Update region &mdash; the dirty area still needing painting.</td></tr>
+  </tbody>
+</table>
+
+<h3>2.5 Property list, scrollbars, menus</h3>
+
+<table>
+  <thead><tr><th>x86 off.</th><th>x64 off.</th><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td class="hex">0x6C</td><td class="hex">0xA8</td><td class="field">PropListHead</td><td>LIST_ENTRY (8&nbsp;B / 16&nbsp;B)</td>
+        <td>Linked-list head of <code>PROPERTY</code> entries
+            (<code>ntuser.h:1099-1104</code>) backing
+            <code>SetProp</code>/<code>GetProp</code>.</td></tr>
+    <tr><td class="hex">0x74</td><td class="hex">0xB8</td><td class="field">PropListItems</td><td>ULONG</td>
+        <td>Count of properties in the list.</td></tr>
+    <tr><td class="hex">0x78</td><td class="hex">0xC0</td><td class="field">pSBInfo</td><td>PSBINFO</td>
+        <td>Scrollbar info: <code>SBINFO { INT WSBflags; SBDATA Horz; SBDATA Vert; }</code>
+            (<code>ntuser.h:511&ndash;516</code>).</td></tr>
+    <tr><td class="hex">0x7C</td><td class="hex">0xC8</td><td class="field">SystemMenu</td><td>HMENU</td>
+        <td>Handle to the window's system (control) menu. The Windows-equivalent
+            field is the commented-out <code>//PMENU spmenuSys;</code>.</td></tr>
+    <tr><td class="hex">0x80</td><td class="hex">0xD0</td><td class="field">IDMenu</td><td>UINT_PTR</td>
+        <td>Top-level windows: HMENU of the menu bar; child windows: integer
+            child-control ID. Comment marks the eventual port:
+            <code>// Use spmenu</code>.</td></tr>
+    <tr><td class="hex">0x84</td><td class="hex">0xD8</td><td class="field">hrgnClip</td><td>HRGN</td>
+        <td>Clip region set via <code>SetWindowRgn</code>.</td></tr>
+    <tr><td class="hex">0x88</td><td class="hex">0xE0</td><td class="field">hrgnNewFrame</td><td>HRGN</td>
+        <td>Pending new frame region used during region transitions
+            (Vista&nbsp;6.0+).</td></tr>
+  </tbody>
+</table>
+
+<h3>2.6 Window text and extra bytes</h3>
+
+<p><code>LARGE_UNICODE_STRING</code> is defined at
+<code>ntuser.h:81&ndash;87</code>:</p>
+
+<pre><code>typedef struct _LARGE_UNICODE_STRING {
+    ULONG Length;
+    ULONG MaximumLength:31;
+    ULONG bAnsi:1;
+    PWSTR Buffer;
+} LARGE_UNICODE_STRING;</code></pre>
+
+<table>
+  <thead><tr><th>x86 off.</th><th>x64 off.</th><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td class="hex">0x8C</td><td class="hex">0xE8</td><td class="field">strName</td><td>LARGE_UNICODE_STRING (12&nbsp;B / 16&nbsp;B)</td>
+        <td>Window title text. <code>SetWindowText</code> /
+            <code>GetWindowText</code> operate on this. Carries an explicit
+            <code>bAnsi</code> bit so ANSI vs Unicode origin survives.</td></tr>
+    <tr><td class="hex">0x98</td><td class="hex">0xF8</td><td class="field">cbwndExtra</td><td>ULONG</td>
+        <td>Bytes of extra data after the WND struct &mdash; the area
+            <code>GetWindowLongPtr</code>/<code>SetWindowLongPtr</code> reach at
+            positive offsets. Initialized from
+            <code>pcls-&gt;cbwndExtra</code>.</td></tr>
+  </tbody>
+</table>
+
+<h3>2.7 Activation, IME, user data, clipboard</h3>
+
+<table>
+  <thead><tr><th>x86 off.</th><th>x64 off.</th><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td class="hex">0x9C</td><td class="hex">0x100</td><td class="field">spwndLastActive</td><td>PWND</td>
+        <td>Last active descendant &mdash; restored when this window regains
+            focus.</td></tr>
+    <tr><td class="hex">0xA0</td><td class="hex">0x108</td><td class="field">hImc</td><td>HIMC</td>
+        <td>Input Method Context for this window
+            (comment at line 740: &ldquo;Input context associated with this
+            window.&rdquo;).</td></tr>
+    <tr><td class="hex">0xA4</td><td class="hex">0x110</td><td class="field">dwUserData</td><td>LONG_PTR</td>
+        <td>The <code>GWLP_USERDATA</code> slot (per-window user data).</td></tr>
+    <tr><td class="hex">0xA8</td><td class="hex">0x118</td><td class="field">pActCtx</td><td>PVOID</td>
+        <td>Side-by-side activation context (<code>SxS</code>). Captured into
+            <code>ClientInfo-&gt;CallbackWnd.pActCtx</code> on every callback
+            (<code>callback.c:111</code>).</td></tr>
+    <tr><td class="hex">0xAC</td><td class="hex">0x120</td><td class="field">spwndClipboardListener</td><td>PWND</td>
+        <td>Next entry in the clipboard listener chain
+            (<code>AddClipboardFormatListener</code>).</td></tr>
+    <tr><td class="hex">0xB0</td><td class="hex">0x128</td><td class="field">ExStyle2</td><td>DWORD</td>
+        <td>Second extended-style word; flags <code>WS_EX2_*</code> defined at
+            <code>ntuser.h:680&ndash;684</code>:
+            <code>WS_EX2_HASOVERLAY&nbsp;0x200</code>,
+            <code>WS_EX2_CONSOLEWINDOW&nbsp;0x400</code>, etc.</td></tr>
+  </tbody>
+</table>
+
+<p>The <code>//PD3DMATRIX pTransForm;</code> comment at line 743 is a
+placeholder for a Vista-era field never ported. In real Windows it sits at
+x64 offset <code>0x110</code>.</p>
+
+<h3>2.8 ReactOS-specific tail (everything below the
+&ldquo;<code>/* ReactOS */</code>&rdquo; marker at line 747)</h3>
+
+<table>
+  <thead><tr><th>x86 off.</th><th>x64 off.</th><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td class="hex">0xB4</td><td class="hex">0x130</td><td class="field">InternalPos.NormalRect</td><td>RECT (16&nbsp;B)</td>
+        <td>Saved restored-state rectangle for
+            <code>GetWindowPlacement</code>.</td></tr>
+    <tr><td class="hex">0xC4</td><td class="hex">0x140</td><td class="field">InternalPos.IconPos</td><td>POINT (8&nbsp;B)</td>
+        <td>Position when minimized.</td></tr>
+    <tr><td class="hex">0xCC</td><td class="hex">0x148</td><td class="field">InternalPos.MaxPos</td><td>POINT (8&nbsp;B)</td>
+        <td>Position when maximized.</td></tr>
+    <tr><td class="hex">0xD4</td><td class="hex">0x150</td><td class="field">InternalPos.flags</td><td>UINT</td>
+        <td><code>WPF_*</code> bits: <code>WPF_MININIT&nbsp;0x08</code>,
+            <code>WPF_MAXINIT&nbsp;0x10</code>
+            (<code>ntuser.h:686&ndash;687</code>).</td></tr>
+    <tr><td class="hex">0xD8</td><td class="hex">0x158</td><td class="field">Unicode:1, InternalPosInitialized:1, HideFocus:1, HideAccel:1</td><td>UINT (bitfield)</td>
+        <td>Flag bits. Comments on lines 756&ndash;759 give intent:
+            <code>!(WNDS_ANSICREATOR|WNDS_ANSIWINDOWPROC)</code>;
+            whether <code>InternalPos</code> has been populated;
+            <code>WS_EX_UISTATEFOCUSRECTHIDDEN</code>;
+            <code>WS_EX_UISTATEKBACCELHIDDEN</code>.</td></tr>
+    <tr><td class="hex">0xDC</td><td class="hex">0x160</td><td class="field">pSBInfoex</td><td>PSBINFOEX</td>
+        <td>Extended scrollbar info (<code>SCROLLBARINFO</code> +
+            <code>SCROLLINFO</code>, <code>ntuser.h:598&ndash;602</code>).
+            Comment: <em>&ldquo;convert to PSBINFO&rdquo;</em>.</td></tr>
+    <tr><td class="hex">0xE0</td><td class="hex">0x168</td><td class="field">ThreadListEntry</td><td>LIST_ENTRY (8&nbsp;B / 16&nbsp;B)</td>
+        <td>Entry in the owning thread's window list.</td></tr>
+    <tr><td class="hex">0xE8</td><td class="hex">0x178</td><td class="field">DialogPointer</td><td>PVOID</td>
+        <td>Non-NULL when this window was created as a dialog &mdash; holds the
+            DIALOGINFO/dialog template pointer.</td></tr>
+  </tbody>
+</table>
+
+<p class="legend"><strong>Note on x64 offsets:</strong> the table reflects
+natural alignment with 8-byte pointers and the implicit padding
+<code>cl</code>/<code>gcc</code> insert to align pointers and aggregates.
+ReactOS is built primarily for x86; the canonical x64 layout for Windows is
+documented in section 3 below.</p>
+
+<h3>2.9 Total size and the layout sentinel</h3>
+
+<p>Summing the fields above gives a total size of
+<strong>0xEC&nbsp;=&nbsp;236&nbsp;bytes</strong> on x86 and roughly
+<strong>0x180&nbsp;bytes</strong> on x64. The size is enforced to be a
+pointer-multiple by the assertion in <code>ntuser.h:1247</code>:</p>
+
+<pre><code>C_ASSERT(sizeof(WND) % sizeof(PVOID) == 0);</code></pre>
+
+<p>Immediately after the typedef, the sentinel <code>PWND_BOTTOM</code> is
+defined (<code>ntuser.h:769</code>):</p>
+
+<pre><code>#define PWND_BOTTOM ((PWND)1)</code></pre>
+
+<p>This is used in Z-order operations to mean &ldquo;bottom of stack&rdquo;,
+distinct from <code>NULL</code>.</p>
+
+<h3>2.10 Specialized derivatives that embed <code>WND</code></h3>
+
+<p>The header defines three subtypes (<code>ntuser.h:771&ndash;792</code>) that
+all begin with a full <code>WND</code>, so a <code>PWND</code> can be
+down-cast based on its <code>fnid</code>:</p>
+
+<pre><code>typedef struct _SBWND   { WND wnd; BOOL fVert; UINT wDisableFlags; SBCALC SBCalc; } SBWND;     // FNID_SCROLLBAR
+typedef struct _MDIWND  { WND wnd; DWORD dwReserved; PVOID pmdi; } MDIWND;                       // MDI client
+typedef struct _MENUWND { WND wnd; PPOPUPMENU ppopupmenu; } MENUWND;                              // FNID_MENU</code></pre>
+
+
+<h2>3. Windows <code>tagWND</code> layout (Windows 7, from PDB symbols)</h2>
+
+<p>The most authoritative public reference is Geoff Chappell's WND page,
+built from PDB symbols Microsoft shipped for Windows&nbsp;7 (the last version
+for which type information for <code>tagWND</code> was published).
+The following table reproduces his offsets and matches them against the
+ReactOS layout. <strong>x64 offsets are confirmed against shipped symbols.</strong></p>
+
+<table>
+  <thead><tr>
+    <th>x86 off.</th><th>x64 off.</th>
+    <th>Windows field</th><th>Type</th>
+    <th>ReactOS equivalent</th><th>Status</th>
+  </tr></thead>
+  <tbody>
+    <tr><td class="hex">0x00</td><td class="hex">0x00</td>
+        <td class="field">head</td><td>THRDESKHEAD</td>
+        <td class="field">head</td><td>identical</td></tr>
+    <tr><td class="hex">0x14</td><td class="hex">0x28</td>
+        <td class="field">ww (substruct)</td><td>WW</td>
+        <td>inline state, state2, ExStyle, style, hModule, fnid</td>
+        <td>same fields, inlined; ReactOS omits 16-bit <code>hMod16</code></td></tr>
+    <tr><td class="hex">0x2C</td><td class="hex">0x48</td>
+        <td class="field">spwndNext</td><td>WND*</td>
+        <td class="field">spwndNext</td><td>identical</td></tr>
+    <tr><td class="hex">0x30</td><td class="hex">0x50</td>
+        <td class="field">spwndPrev</td><td>WND*</td>
+        <td class="field">spwndPrev</td><td>identical</td></tr>
+    <tr><td class="hex">0x34</td><td class="hex">0x58</td>
+        <td class="field">spwndParent</td><td>WND*</td>
+        <td class="field">spwndParent</td><td>identical</td></tr>
+    <tr><td class="hex">0x38</td><td class="hex">0x60</td>
+        <td class="field">spwndChild</td><td>WND*</td>
+        <td class="field">spwndChild</td><td>identical</td></tr>
+    <tr><td class="hex">0x3C</td><td class="hex">0x68</td>
+        <td class="field">spwndOwner</td><td>WND*</td>
+        <td class="field">spwndOwner</td><td>identical</td></tr>
+    <tr><td class="hex">0x40</td><td class="hex">0x70</td>
+        <td class="field">rcWindow</td><td>RECT</td>
+        <td class="field">rcWindow</td><td>identical</td></tr>
+    <tr><td class="hex">0x50</td><td class="hex">0x80</td>
+        <td class="field">rcClient</td><td>RECT</td>
+        <td class="field">rcClient</td><td>identical</td></tr>
+    <tr><td class="hex">0x60</td><td class="hex">0x90</td>
+        <td class="field">lpfnWndProc</td><td>WNDPROC</td>
+        <td class="field">lpfnWndProc</td><td>identical</td></tr>
+    <tr><td class="hex">0x64</td><td class="hex">0x98</td>
+        <td class="field">pcls</td><td>CLS*</td>
+        <td class="field">pcls</td><td>identical</td></tr>
+    <tr><td class="hex">0x68</td><td class="hex">0xA0</td>
+        <td class="field">hrgnUpdate</td><td>HRGN</td>
+        <td class="field">hrgnUpdate</td><td>identical</td></tr>
+    <tr><td class="hex">0x6C</td><td class="hex">0xA8</td>
+        <td class="field">ppropList</td><td>PROPLIST*</td>
+        <td>LIST_ENTRY PropListHead + ULONG PropListItems</td>
+        <td>same purpose, ReactOS uses an explicit list head + count</td></tr>
+    <tr><td class="hex">0x70</td><td class="hex">0xB0</td>
+        <td class="field">pSBInfo</td><td>SBINFO*</td>
+        <td class="field">pSBInfo</td><td>identical</td></tr>
+    <tr><td class="hex">0x74</td><td class="hex">0xB8</td>
+        <td class="field">spmenuSys</td><td>MENU*</td>
+        <td class="field">SystemMenu (HMENU)</td>
+        <td>ReactOS holds the HMENU; Windows uses the kernel MENU pointer</td></tr>
+    <tr><td class="hex">0x78</td><td class="hex">0xC0</td>
+        <td class="field">spmenu</td><td>MENU*</td>
+        <td class="field">IDMenu (UINT_PTR)</td>
+        <td>HMENU or child-control id (commented <code>// Use spmenu</code>)</td></tr>
+    <tr><td class="hex">0x7C</td><td class="hex">0xC8</td>
+        <td class="field">hrgnClip</td><td>HRGN</td>
+        <td class="field">hrgnClip</td><td>identical</td></tr>
+    <tr><td class="hex">0x80</td><td class="hex">0xD0</td>
+        <td class="field">hrgnNewFrame (6.0+)</td><td>HRGN</td>
+        <td class="field">hrgnNewFrame</td><td>identical</td></tr>
+    <tr><td class="hex">0x84</td><td class="hex">0xD8</td>
+        <td class="field">strName</td><td>LARGE_UNICODE_STRING</td>
+        <td class="field">strName</td><td>identical type and field</td></tr>
+    <tr><td class="hex">0x90</td><td class="hex">0xE8</td>
+        <td class="field">cbwndExtra</td><td>INT</td>
+        <td class="field">cbwndExtra</td><td>identical</td></tr>
+    <tr><td class="hex">0x94</td><td class="hex">0xF0</td>
+        <td class="field">spwndLastActive</td><td>WND*</td>
+        <td class="field">spwndLastActive</td><td>identical</td></tr>
+    <tr><td class="hex">0x98</td><td class="hex">0xF8</td>
+        <td class="field">hImc</td><td>HIMC</td>
+        <td class="field">hImc</td><td>identical</td></tr>
+    <tr><td class="hex">0x9C</td><td class="hex">0xF8</td>
+        <td class="field">dwUserData</td><td>DWORD / LONG_PTR</td>
+        <td class="field">dwUserData</td><td>ReactOS uses LONG_PTR (64-bit clean)</td></tr>
+    <tr><td class="hex">0xA0</td><td class="hex">0x108</td>
+        <td class="field">pActCtx (5.1+)</td><td>ACTIVATION_CONTEXT*</td>
+        <td class="field">pActCtx</td><td>identical</td></tr>
+    <tr><td class="hex">0xA4</td><td class="hex">0x110</td>
+        <td class="field">pTransform (6.0+)</td><td>D3DMATRIX*</td>
+        <td>commented out: <code>//PD3DMATRIX pTransForm;</code></td>
+        <td>not implemented in ReactOS</td></tr>
+    <tr><td class="hex">0xA8</td><td class="hex">0x118</td>
+        <td class="field">spwndClipboardListenerNext (6.0+)</td><td>WND*</td>
+        <td class="field">spwndClipboardListener</td>
+        <td>identical role, slightly shorter name</td></tr>
+    <tr><td class="hex">0xAC</td><td class="hex">0x120</td>
+        <td class="field">ExStyle2 (6.0+)</td><td>ULONG</td>
+        <td class="field">ExStyle2</td><td>identical</td></tr>
+  </tbody>
+</table>
+
+<p>Below <code>ExStyle2</code>, ReactOS appends six extra fields (the
+<code>InternalPos</code> block, four bitfields, <code>pSBInfoex</code>,
+<code>ThreadListEntry</code>, and <code>DialogPointer</code>) that have no
+counterpart in Windows. They are explicitly fenced off in the source
+(<code>ntuser.h:747</code>: <em>&ldquo;<code>/* ReactOS */</code>&rdquo;</em>).</p>
+
+<div class="ros"><strong>Verdict.</strong> ReactOS's
+<code>WND</code> is a deliberate, byte-compatible re-implementation of the
+Windows&nbsp;7-era <code>tagWND</code>, with two purposeful divergences in
+internal type choice (<code>PROPLIST*</code> &rarr; explicit list-head, and
+<code>MENU*</code> &rarr; <code>HMENU</code>/<code>UINT_PTR</code>), one
+commented-out Vista field (<code>pTransform</code>), and a clearly delimited
+ReactOS-only tail.</div>
+
+
+<h2>4. The <code>PWND</code> typedef and its three pointer relationships</h2>
+
+<p><code>PWND</code> is just a pointer type alias for <code>WND&nbsp;*</code>
+(<code>ntuser.h:767</code>). When ReactOS code says &ldquo;the WND points to
+pWnd&rdquo; there are three distinct pointer relationships at play.</p>
+
+<h3>4.1 Self-pointer: <code>head.pSelf</code> (kernel address of itself)</h3>
+
+<p>When a WND is allocated, the head's <code>pSelf</code> is set to its own
+kernel address (<code>win32ss/user/ntuser/object.c:72&ndash;86</code>):</p>
+
+<pre><code>ObjHead = DesktopHeapAlloc(pDesk, Size);
+RtlZeroMemory(ObjHead, Size);
+ObjHead-&gt;pSelf  = ObjHead;     // self-pointer
+ObjHead-&gt;rpdesk = pDesk;
+ObjHead-&gt;pti    = pti;</code></pre>
+
+<p>So <code>pWnd-&gt;head.pSelf</code> always equals the kernel address of
+<code>pWnd</code>.</p>
+
+<h3>4.2 Handle &harr; pointer: the global handle table</h3>
+
+<p>The <code>HWND</code> in <code>head.h</code> indexes
+<code>gHandleTable</code>. Kernel-side resolution
+(<code>win32ss/user/ntuser/window.c:123&ndash;141</code>):</p>
+
+<pre><code>PWND FASTCALL UserGetWindowObject(HWND hWnd)
+{
+   PWND Window;
+   if (!hWnd) { EngSetLastError(ERROR_INVALID_WINDOW_HANDLE); return NULL; }
+   Window = (PWND)UserGetObject(gHandleTable, hWnd, TYPE_WINDOW);
+   if (!Window || (Window-&gt;state &amp; WNDS_DESTROYED))
+       { EngSetLastError(ERROR_INVALID_WINDOW_HANDLE); return NULL; }
+   return Window;
+}</code></pre>
+
+<p>User-side resolution
+(<code>win32ss/user/user32/misc/misc.c:357&ndash;369</code>):</p>
+
+<pre><code>PWND FASTCALL ValidateHwnd(HWND hwnd)
+{
+    PCLIENTINFO ClientInfo = GetWin32ClientInfo();
+    /* See if the window is cached */
+    if (hwnd &amp;&amp; hwnd == ClientInfo-&gt;CallbackWnd.hWnd)
+        return ClientInfo-&gt;CallbackWnd.pWnd;     /* fast path */
+    return ValidateHandle((HANDLE)hwnd, TYPE_WINDOW);
+}</code></pre>
+
+<p><code>ValidateHandle</code> looks up <code>pEntry-&gt;ptr</code> in the
+shared handle table and translates it to a user-mode address with
+<code>DesktopPtrToUser</code> (<code>misc.c:297&ndash;301</code>).</p>
+
+<h3>4.3 Per-thread cache: <code>ClientInfo-&gt;CallbackWnd.pWnd</code></h3>
+
+<p><code>CALLBACKWND</code> (<code>ntuser.h:293&ndash;298</code>) is a tiny
+3-field cache living in the per-thread <code>CLIENTINFO</code> in the TEB:</p>
+
+<pre><code>typedef struct _CALLBACKWND {
+    HWND hWnd;
+    struct _WND *pWnd;
+    PVOID pActCtx;
+} CALLBACKWND, *PCALLBACKWND;</code></pre>
+
+<p>It is refilled by the kernel on every callback into user-mode in
+<code>IntSetTebWndCallback</code>
+(<code>win32ss/user/ntuser/callback.c:96&ndash;118</code>):</p>
+
+<pre><code>PWND Window = UserGetWindowObject(*hWnd);
+PCLIENTINFO ClientInfo = GetWin32ClientInfo();
+...
+if (Window) {
+    ClientInfo-&gt;CallbackWnd.hWnd   = hWndS;
+    ClientInfo-&gt;CallbackWnd.pWnd   = DesktopHeapAddressToUser(Window);
+    ClientInfo-&gt;CallbackWnd.pActCtx = Window-&gt;pActCtx;
+}</code></pre>
+
+<p>So whenever a window proc is called, the matching <code>pWnd</code> is
+already sitting in the TEB and <code>ValidateHwnd</code> returns it without a
+syscall.</p>
+
+<h3>4.4 Why two virtual addresses for one object: desktop-heap double mapping</h3>
+
+<p>The <code>WND</code> lives on the <strong>desktop heap</strong>, which is
+mapped into both kernel and user address spaces at different virtual addresses.
+The fixed offset between the two views is
+<code>ClientInfo-&gt;ulClientDelta</code>. The two translation helpers are
+<code>DesktopHeapAddressToUser</code>
+(<code>win32ss/user/ntuser/desktop.h:307</code>) on the kernel side and
+<code>DesktopPtrToUser</code>
+(<code>win32ss/user/user32/include/user_x.h:11&ndash;34</code>) on the user
+side:</p>
+
+<pre><code>static __inline PVOID DesktopPtrToUser(PVOID Ptr)
+{
+    PCLIENTINFO  pci = GetWin32ClientInfo();
+    PDESKTOPINFO pdi = pci-&gt;pDeskInfo;
+    if ((ULONG_PTR)Ptr &gt;= (ULONG_PTR)pdi-&gt;pvDesktopBase &amp;&amp;
+        (ULONG_PTR)Ptr &lt;  (ULONG_PTR)pdi-&gt;pvDesktopLimit)
+    {
+        return (PVOID)((ULONG_PTR)Ptr - pci-&gt;ulClientDelta);
+    }
+    /* slow path: cross-desktop mapping via syscall */
+    return (PVOID)NtUserxGetDesktopMapping(Ptr);
+}</code></pre>
+
+<p>The same <code>WND</code> therefore has two valid <code>PWND</code> values
+that differ by exactly <code>ulClientDelta</code>:</p>
+
+<ul>
+  <li><strong>Kernel address</strong> &mdash; what <code>head.pSelf</code> stores
+      and what <code>UserGetWindowObject</code> returns to kernel callers.</li>
+  <li><strong>User address</strong> &mdash; <code>kernel - ulClientDelta</code>,
+      what <code>DesktopPtrToUser</code> produces, what gets cached in
+      <code>ClientInfo-&gt;CallbackWnd.pWnd</code>, and what
+      <code>ValidateHwnd</code> hands back to user-mode callers.</li>
+</ul>
+
+<p>This shared mapping is the key reason ReactOS does not need a second
+&ldquo;user copy&rdquo; object &mdash; one allocation is reachable from both
+sides at fixed offset.</p>
+
+
+<h2>5. Win32k Type Isolation: how Windows split <code>tagWND</code></h2>
+
+<p>The Windows&nbsp;7 layout described in section&nbsp;3 was a single
+monolithic kernel object containing kernel pointers (<code>spwndParent</code>,
+<code>pcls</code>, etc.). For roughly fifteen years it was the favourite
+exploitation target in <code>win32k.sys</code>:</p>
+
+<ul>
+  <li>Reading the kernel pointer in any <code>spwnd*</code> field gave attackers
+      a direct kernel-address leak (used to bypass KASLR).</li>
+  <li>Forging or partially overwriting a sibling <code>WND</code> turned
+      almost any write-what-where into arbitrary R/W (CVE-2014-4113,
+      CVE-2015-0061, MS15-061, CVE-2019-1458 &ldquo;WizardOpium&rdquo;,
+      CVE-2021-1732, CVE-2022-21882, &hellip;).</li>
+  <li><code>HMValidateHandle</code> historically returned the kernel pointer
+      directly to user-mode, which became a one-shot KASLR break.</li>
+</ul>
+
+<h3>5.1 Timeline of mitigations</h3>
+
+<table>
+  <thead><tr><th>Windows version</th><th>Mitigation</th></tr></thead>
+  <tbody>
+    <tr><td>Windows 10 1607 (Anniversary, 2016)</td>
+        <td>Kernel pointer references to the desktop heap removed from the
+            Win32ClientInfo block in the TEB &mdash; closing one of the easiest
+            kernel-address leaks.</td></tr>
+    <tr><td>Windows 10 1703 (Creators, 2017)</td>
+        <td><code>HMValidateHandle</code> returns user-mode (rather than
+            kernel-mode) pointers; bytes written by <code>SetWindowLong</code>
+            are no longer applied to the kernel object directly &mdash; killing a
+            common write primitive.</td></tr>
+    <tr><td>Windows 10 1709 (Fall Creators, 2017)</td>
+        <td><strong>Win32k Type Isolation for SURFACE/Bitmap objects.</strong>
+            Pixel-data buffers separated from <code>SURFACE</code> headers so
+            adjacent-bitmap spray no longer reaches kernel pointers (Quarkslab).</td></tr>
+    <tr><td>Windows 10 1803 (April 2018 Update)</td>
+        <td>Additional read/write primitives removed from the
+            <code>tagWND</code> path.</td></tr>
+    <tr><td>Windows 10 1809 (October 2018 Update)</td>
+        <td><strong>Desktop-heap user/kernel separation for
+            <code>tagWND</code>.</strong> The kernel <code>tagWND</code> is
+            split into a kernel-only object plus a separately-allocated user-mode
+            copy that contains no kernel addresses; only the user-mode copy is
+            mapped into the application's address space.</td></tr>
+  </tbody>
+</table>
+
+<h3>5.2 The new layout: a kernel object with a <code>+0x28 *pWND</code> pointer</h3>
+
+<p>After the 1809 split, the kernel <code>tagWND</code> on x64 is roughly:</p>
+
+<pre><code>typedef struct _TAG_WND        /* names from the ByteWhite1x1 reverse-engineered header */
+{
+    HWND          hWnd;                /* 0x00  same as before                         */
+    UINT64        windowCount;         /* 0x08                                         */
+    Win32Thread*  pWin32Thread;        /* 0x10                                         */
+    char          padding_1[0x10];     /* 0x18                                         */
+    WindowStyle*  windowStyle;         /* 0x28  &lt;-- "*pWND" pointer to user-mode copy  */
+    UINT64        userCopyHeapOffset;  /* 0x30                                         */
+    char          padding_2[0x20];
+    _TAG_WND*     next;                /* 0x58                                         */
+    _TAG_WND*     previous;            /* 0x60                                         */
+    _TAG_WND*     parent;              /* 0x68                                         */
+    _TAG_WND*     child;               /* 0x70                                         */
+    char          padding_3[0x40];
+    PWCH*         windowName;          /* 0xB8                                         */
+    char          padding_4[0x8];
+    _TAG_WND*     self;                /* 0xC8                                         */
+} TAG_WND, *PTAG_WND;</code></pre>
+
+<p>Eoin Carroll (Trellix) explicitly labels the field at <code>+0x28</code>:
+<em>&ldquo;I've labeled it as <code>*pWND</code> because Microsoft no longer
+supplies symbols. &hellip; What is important to know about this pointer is
+that it's a user-mode version of the tagWND data that does not include kernel
+addresses, and it is structured differently than its parent tagWND
+structure.&rdquo;</em> The user-mode copy carries window-class properties
+propagated from <code>WNDCLASSEX</code> (style, window proc, background brush,
+menu refs, instance handle), but with user-mode addresses substituted for any
+kernel pointers.</p>
+
+<h3>5.3 Why this matters for ReactOS interpretation</h3>
+
+<div class="danger">
+<p>If you read a modern Windows reverse-engineering article that says
+<em>&ldquo;at offset <code>0x28</code> of <code>tagWND</code> there is a pointer
+to <code>pWND</code>&rdquo;</em>, that statement is <strong>only true for
+Windows 10 1809 and later</strong>. In:</p>
+<ul>
+  <li><strong>Windows&nbsp;7 (and ReactOS):</strong> offset <code>0x28</code>
+      (x64) / <code>0x14</code> (x86) is the start of the inline
+      <code>WW</code> block &mdash; the field at that address is the
+      <code>state</code> DWORD, not a pointer.</li>
+  <li><strong>Windows&nbsp;10 1809+:</strong> offset <code>0x28</code> is a
+      pointer to the user-mapped &ldquo;safe&rdquo; copy of the WND data.</li>
+</ul>
+</div>
+
+<h3>5.4 Why ReactOS does not implement Type Isolation for WND</h3>
+
+<p>A grep across the source confirms there is no
+<code>tagWND_BASE</code>, no <code>WND_BASE</code>, no Type Isolation
+infrastructure for window objects:</p>
+
+<pre><code>$ grep -rn "TypeIsolation\|tagWND_BASE\|WND_BASE" win32ss/ --include="*.h" --include="*.c"
+(no relevant matches)</code></pre>
+
+<p>ReactOS targets binary compatibility with the Windows&nbsp;Server&nbsp;2003 /
+Windows&nbsp;XP / Windows&nbsp;7 era of <code>win32k</code>; the Type
+Isolation hardening was introduced years after that baseline. In ReactOS the
+&ldquo;user copy&rdquo; problem is solved instead by the
+<strong>desktop-heap double mapping</strong> (section&nbsp;4.4): one allocation,
+two virtual addresses, with translation done at lookup time via
+<code>ulClientDelta</code>. There is no defence against the kernel-pointer
+leaks the Type Isolation work eliminated &mdash; that is a known gap of the
+ReactOS architecture.</p>
+
+
+<h2>6. Selected state-bit definitions</h2>
+
+<p>The two state DWORDs of <code>WND</code> carry a large number of flag bits.
+The full list lives at <code>win32ss/include/ntuser.h:605&ndash;670</code>;
+the most commonly observed in the kernel paths are:</p>
+
+<table>
+  <thead><tr><th>Field</th><th>Constant</th><th>Value</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>state</code></td><td>WNDS_HASMENU</td>            <td>0x00000001</td><td>Has a menu bar.</td></tr>
+    <tr><td><code>state</code></td><td>WNDS_HASCAPTION</td>         <td>0x00000008</td><td>Has a caption.</td></tr>
+    <tr><td><code>state</code></td><td>WNDS_SENDSIZEMOVEMSGS</td>   <td>0x00000010</td><td>Pending WM_SIZE / WM_MOVE.</td></tr>
+    <tr><td><code>state</code></td><td>WNDS_NONCPAINT</td>          <td>0x00000100</td><td>Pending NC paint.</td></tr>
+    <tr><td><code>state</code></td><td>WNDS_ERASEBACKGROUND</td>    <td>0x00000400</td><td>Background needs erasing.</td></tr>
+    <tr><td><code>state</code></td><td>WNDS_INTERNALPAINT</td>      <td>0x00001000</td><td>Internal paint pending.</td></tr>
+    <tr><td><code>state</code></td><td>WNDS_DIALOGWINDOW</td>       <td>0x00010000</td><td>Window is a dialog.</td></tr>
+    <tr><td><code>state</code></td><td>WNDS_SERVERSIDEWINDOWPROC</td><td>0x00040000</td><td>WndProc executes inside win32k.</td></tr>
+    <tr><td><code>state</code></td><td>WNDS_ANSIWINDOWPROC</td>     <td>0x00080000</td><td>WndProc is ANSI.</td></tr>
+    <tr><td><code>state</code></td><td>WNDS_ANSICREATOR</td>        <td>0x20000000</td><td>Window was created via ANSI API.</td></tr>
+    <tr><td><code>state</code></td><td>WNDS_DESTROYED</td>          <td>0x80000000</td><td>Tear-down has begun.</td></tr>
+    <tr><td><code>state2</code></td><td>WNDS2_WMPAINTSENT</td>      <td>0x00000001</td><td>WM_PAINT already dispatched.</td></tr>
+    <tr><td><code>state2</code></td><td>WNDS2_HASCLIENTEDGE</td>    <td>0x00000010</td><td>Has WS_EX_CLIENTEDGE frame.</td></tr>
+    <tr><td><code>state2</code></td><td>WNDS2_INDESTROY</td>        <td>0x00000080</td><td>Currently inside <code>NtUserDestroyWindow</code>.</td></tr>
+    <tr><td><code>state2</code></td><td>WNDS2_FULLSCREENMODE</td>   <td>0x01000000</td><td>Full-screen mode.</td></tr>
+    <tr><td><code>state2</code></td><td>WNDS2_SHELLHOOKREGISTERED</td><td>0x40000000</td><td>Shell hook registered for this window.</td></tr>
+  </tbody>
+</table>
+
+<p>Tear-down is signalled by the joint check used in <code>VerifyWnd</code>
+(<code>win32ss/user/ntuser/window.c:88&ndash;106</code>):</p>
+
+<pre><code>if (!pWnd ||
+    (pWnd-&gt;state  &amp; WNDS_DESTROYED)  ||
+    (pWnd-&gt;state2 &amp; WNDS2_INDESTROY))
+    return NULL;</code></pre>
+
+
+<h2>7. End-to-end resolution of an HWND in ReactOS</h2>
+
+<pre><code>HWND  ──► ValidateHwnd                       (user32: misc/misc.c:357)
+            │
+            ├─ fast path: hwnd == ClientInfo-&gt;CallbackWnd.hWnd
+            │             return ClientInfo-&gt;CallbackWnd.pWnd       (already user-mapped)
+            │
+            └─ slow path: ValidateHandle(hwnd, TYPE_WINDOW)          (misc/misc.c:252)
+                          │
+                          ├─ pEntry      = GetUser32Handle(hwnd)
+                          ├─ pEntry-&gt;ptr  ── kernel address of WND
+                          └─ DesktopPtrToUser(pEntry-&gt;ptr)           (include/user_x.h:11)
+                                            │
+                                            └─ kernel_addr - ulClientDelta
+                                              → user-side PWND</code></pre>
+
+<p>And from a kernel-side <code>PWND</code>, going back to the
+<code>HWND</code> is just <code>UserHMGetHandle(pWnd)</code> (i.e.
+<code>pWnd-&gt;head.h</code>), and the kernel self-pointer is
+<code>pWnd-&gt;head.pSelf</code>.</p>
+
+
+<h2>8. Source-file index</h2>
+
+<table>
+  <thead><tr><th>Path</th><th>Role</th></tr></thead>
+  <tbody>
+    <tr><td><code>win32ss/include/ntuser.h:693&ndash;767</code></td>
+        <td>The <code>_WND</code> struct definition itself.</td></tr>
+    <tr><td><code>win32ss/include/ntuser.h:179&ndash;196</code></td>
+        <td><code>HEAD</code> / <code>THROBJHEAD</code> / <code>THRDESKHEAD</code>.</td></tr>
+    <tr><td><code>win32ss/include/ntuser.h:81&ndash;87</code></td>
+        <td><code>LARGE_UNICODE_STRING</code>.</td></tr>
+    <tr><td><code>win32ss/include/ntuser.h:511&ndash;516</code></td>
+        <td><code>SBINFO</code> / <code>SBDATA</code>.</td></tr>
+    <tr><td><code>win32ss/include/ntuser.h:598&ndash;602</code></td>
+        <td><code>SBINFOEX</code>.</td></tr>
+    <tr><td><code>win32ss/include/ntuser.h:605&ndash;670</code></td>
+        <td><code>WNDS_*</code> / <code>WNDS2_*</code> state bits.</td></tr>
+    <tr><td><code>win32ss/include/ntuser.h:680&ndash;684</code></td>
+        <td><code>WS_EX2_*</code> bits for <code>ExStyle2</code>.</td></tr>
+    <tr><td><code>win32ss/include/ntuser.h:230-231</code></td>
+        <td><code>UserHMGetHandle</code> / <code>UserHMSetHandle</code> macros.</td></tr>
+    <tr><td><code>win32ss/include/ntuser.h:293&ndash;298</code></td>
+        <td><code>CALLBACKWND</code> (per-thread <code>HWND/PWND</code> cache).</td></tr>
+    <tr><td><code>win32ss/include/ntuser.h:1247</code></td>
+        <td><code>C_ASSERT(sizeof(WND) % sizeof(PVOID) == 0)</code>.</td></tr>
+    <tr><td><code>win32ss/user/ntuser/object.c:57&ndash;87</code></td>
+        <td><code>AllocDeskThreadObject</code> &mdash; sets <code>pSelf</code>,
+            <code>rpdesk</code>, <code>pti</code>.</td></tr>
+    <tr><td><code>win32ss/user/ntuser/window.c:88&ndash;141</code></td>
+        <td><code>VerifyWnd</code>, <code>ValidateHwndNoErr</code>,
+            <code>UserGetWindowObject</code>.</td></tr>
+    <tr><td><code>win32ss/user/ntuser/callback.c:96&ndash;118</code></td>
+        <td><code>IntSetTebWndCallback</code> &mdash; refills the TEB
+            <code>CallbackWnd</code>.</td></tr>
+    <tr><td><code>win32ss/user/user32/misc/misc.c:252&ndash;369</code></td>
+        <td><code>ValidateHandle</code>, <code>ValidateHwnd</code>.</td></tr>
+    <tr><td><code>win32ss/user/user32/include/user_x.h:1&ndash;34</code></td>
+        <td><code>SharedPtrToUser</code>, <code>DesktopPtrToUser</code>.</td></tr>
+    <tr><td><code>win32ss/user/ntuser/desktop.h:307</code></td>
+        <td><code>DesktopHeapAddressToUser</code>.</td></tr>
+  </tbody>
+</table>
+
+
+<h2>9. References</h2>
+
+<ul class="refs">
+  <li>Geoff Chappell, <em>WND</em> &mdash; offsets and field names from
+      Windows&nbsp;7 PDB symbols:
+      <a href="https://www.geoffchappell.com/studies/windows/win32/user32/structs/wnd/index.htm">
+      geoffchappell.com/studies/windows/win32/user32/structs/wnd</a>.</li>
+  <li>Eoin Carroll (Trellix / McAfee ATR), <em>Mapping win32k User to Kernel
+      tagWND Data Structures</em>:
+      <a href="https://www.trellix.com/assets/docs/atr-library/tr-mapping-win32k-user-to-kernel-tagwnd-data-structures.pdf">
+      trellix.com / atr-library</a>.</li>
+  <li>Unit&nbsp;42, <em>Inside Win32k Exploitation: Background on Implementations
+      of Win32k and Exploitation Methodologies</em>:
+      <a href="https://unit42.paloaltonetworks.com/win32k-analysis-part-1/">
+      unit42.paloaltonetworks.com</a>.</li>
+  <li>Quarkslab, <em>Reverse Engineering the Win32k Type Isolation
+      Mitigation</em>:
+      <a href="https://blog.quarkslab.com/reverse-engineering-the-win32k-type-isolation-mitigation.html">
+      blog.quarkslab.com</a>.</li>
+  <li>Core Security, <em>Analysis of CVE-2022-21882: Win32k Window Object Type
+      Confusion Exploit</em>:
+      <a href="https://www.coresecurity.com/core-labs/articles/analysis-cve-2022-21882-win32k-window-object-type-confusion-exploit">
+      coresecurity.com / core-labs</a>.</li>
+  <li>ByteRaptors, <em>The WizardOpium LPE: Exploiting CVE-2019-1458</em>:
+      <a href="https://byteraptors.github.io/windows/exploitation/2020/06/03/exploitingcve2019-1458.html">
+      byteraptors.github.io</a>.</li>
+  <li>ByteWhite1x1, reverse-engineered <code>TAG_WND</code> header for modern
+      Windows&nbsp;10:
+      <a href="https://github.com/ByteWhite1x1/tagWND">
+      github.com/ByteWhite1x1/tagWND</a>.</li>
+  <li>ReactOS Techwiki, <em>Win32k/WND</em> (referenced from
+      <code>ntuser.h:691</code>):
+      <a href="https://reactos.org/wiki/Techwiki:Win32k/WND">
+      reactos.org/wiki/Techwiki:Win32k/WND</a>.</li>
+</ul>
+
+</body>
+</html>
